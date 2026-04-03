@@ -24,7 +24,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo -e "\n${YELLOW}[*] Установка зависимостей Python...${NC}"
-python -m pip install requests dnslib --break-system-packages > /dev/null 2>&1 || python3 -m pip install requests dnslib > /dev/null 2>&1
+python3 -m pip install requests dnslib --break-system-packages > /dev/null 2>&1 || python3 -m pip install requests dnslib > /dev/null 2>&1
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}[+] Зависимости установлены.${NC}"
 else
