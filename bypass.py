@@ -23,7 +23,7 @@ adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
 doh_session.mount("https://", adapter)
 
 ROUTE_TTL = 3600 * 12
-GW_CHECK_INTERVAL = 3  # Быстрая проверка сети
+GW_CHECK_INTERVAL = 3
 GC_INTERVAL = 300
 
 state_lock = threading.Lock()
@@ -35,10 +35,9 @@ CMD_NETWORKSETUP = "/usr/sbin/networksetup"
 CMD_DSCACHEUTIL = "/usr/bin/dscacheutil"
 CMD_KILLALL = "/usr/bin/killall"
 CMD_ROUTE = "/sbin/route"
-CMD_IFCONFIG = "/sbin/ifconfig"
 
 DIRECT_DOMAINS = (
-    ".ru.", ".vk.com.", ".vk.me.", "yandex.cloud.", "boosty.to."
+    ".ru.", ".vk.com.", ".vk.me.", "yandex.cloud."
 )
 
 def log(msg):
@@ -52,10 +51,11 @@ def get_physical_gateway():
     except Exception:
         return None
 
-def get_up_interfaces():
-    """Получает список всех активных интерфейсов (включая VPN utun)"""
+def get_vpn_route_state():
+    """Получает слепок таблицы маршрутизации для VPN-интерфейсов (Amnezia, Tunnelblick и др.)"""
     try:
-        return subprocess.check_output([CMD_IFCONFIG, "-lu"], stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+        cmd = "netstat -rn -f inet | grep -E 'utun|tun|tap|ipsec|ppp|wg'"
+        return subprocess.check_output(cmd, shell=True, timeout=5, stderr=subprocess.DEVNULL).decode().strip()
     except Exception:
         return ""
 
@@ -68,7 +68,7 @@ def flush_dns_cache():
 
 def set_system_dns(dns_server):
     try:
-        subprocess.run([CMD_NETWORKSETUP, "-setdnsservers", WIFI_INTERFACE_NAME, dns_server], 
+        subprocess.run([CMD_NETWORKSETUP, "-setdnsservers", WIFI_INTERFACE_NAME, dns_server],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         if dns_server == "Empty":
             log("[*] Системный DNS: DHCP")
@@ -80,8 +80,8 @@ def set_system_dns(dns_server):
 def gateway_watcher():
     global current_gateway
     was_disconnected = False
-    current_up_interfaces = get_up_interfaces()
-    
+    current_vpn_state = get_vpn_route_state()
+
     while True:
         try:
             # 1. Проверка физического шлюза (Wi-Fi)
@@ -111,16 +111,15 @@ def gateway_watcher():
                         set_system_dns(LISTEN_IP)
                         flush_dns_cache()
 
-            # 2. ДЕТЕКТОР VPN (Смена интерфейсов)
-            new_up_interfaces = get_up_interfaces()
-            if new_up_interfaces and new_up_interfaces != current_up_interfaces:
-                if "utun" in new_up_interfaces or "utun" in current_up_interfaces:
-                    log("[*] Изменение VPN-туннелей. Сброс кэша маршрутов!")
-                    with state_lock:
-                        routed_ips.clear()
-                    set_system_dns(LISTEN_IP)
-                    flush_dns_cache()
-                current_up_interfaces = new_up_interfaces
+            # 2. ДЕТЕКТОР VPN (Таблица маршрутизации)
+            new_vpn_state = get_vpn_route_state()
+            if new_vpn_state != current_vpn_state:
+                log("[*] Изменение VPN-маршрутов (Amnezia/Tunnelblick). Сброс кэша маршрутов!")
+                with state_lock:
+                    routed_ips.clear()
+                set_system_dns(LISTEN_IP)
+                flush_dns_cache()
+                current_vpn_state = new_vpn_state
 
         except Exception:
             pass
@@ -129,20 +128,19 @@ def gateway_watcher():
 def sleep_detector():
     """Безупречное обнаружение выхода из спящего режима через time.monotonic"""
     global current_gateway
-    
+
     last_wall = time.time()
     last_mono = time.monotonic()
-    
+
     while True:
         time.sleep(2)
-        
+
         now_wall = time.time()
         now_mono = time.monotonic()
-        
+
         wall_delta = now_wall - last_wall
         mono_delta = now_mono - last_mono
-        
-        # Если разница больше 5 секунд, значит процессор простаивал в режиме сна
+
         if (wall_delta - mono_delta) > 5.0:
             log(f"[*] ДЕТЕКТОР СНА: Выход из спящего режима (спали ~{int(wall_delta)}с). Обновление!")
             with state_lock:
@@ -150,7 +148,7 @@ def sleep_detector():
                 cg = get_physical_gateway()
                 if cg:
                     current_gateway = cg
-        
+
         last_wall = now_wall
         last_mono = now_mono
 
@@ -162,7 +160,7 @@ def route_garbage_collector():
             expired_ips = [ip for ip, ts in routed_ips.items() if now - ts > ROUTE_TTL]
             for ip in expired_ips:
                 try:
-                    subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], 
+                    subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
                 except Exception:
                     pass
@@ -175,7 +173,7 @@ def cleanup_and_exit(signum, frame):
     with state_lock:
         for ip in routed_ips.keys():
             try:
-                subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], 
+                subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             except Exception:
                 pass
@@ -186,13 +184,13 @@ signal.signal(signal.SIGINT, cleanup_and_exit)
 
 def handle_request(data, addr, main_sock):
     global current_gateway
-    
+
     try:
         record = DNSRecord.parse(data)
         qname = str(record.q.qname).lower()
         qtype = record.q.qtype
         is_ru = qname.endswith(DIRECT_DOMAINS)
-        
+
         if is_ru and qtype == 28:
             reply = record.reply()
             main_sock.sendto(reply.pack(), addr)
@@ -205,10 +203,10 @@ def handle_request(data, addr, main_sock):
                 if local_gw:
                     with state_lock:
                         current_gateway = local_gw
-            
+
             if not local_gw:
-                return 
-                
+                return
+
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as up_sock:
                     up_sock.settimeout(2.0)
@@ -234,13 +232,13 @@ def handle_request(data, addr, main_sock):
                     resp_data, _ = up_sock.recvfrom(4096)
 
         resp_record = DNSRecord.parse(resp_data)
-        
+
         if is_ru:
             for rr in resp_record.rr:
                 if rr.rtype == 1:
                     ip = str(rr.rdata)
                     need_to_route = False
-                                
+
                     if local_gw:
                         with state_lock:
                             if len(routed_ips) > 5000:
@@ -250,14 +248,14 @@ def handle_request(data, addr, main_sock):
                                 need_to_route = True
                             else:
                                 routed_ips[ip] = time.time()
-                                
+
                         if need_to_route:
-                            subprocess.run([CMD_ROUTE, "-q", "add", "-host", ip, local_gw], 
+                            subprocess.run([CMD_ROUTE, "-q", "add", "-host", ip, local_gw],
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
                             log(f"[+] Маршрут: {qname} -> {ip} via {local_gw}")
-                            
+
         main_sock.sendto(resp_data, addr)
-        
+
     except Exception as e:
         log(f"[-] Ошибка в handle_request: {e}")
 
@@ -270,14 +268,13 @@ if __name__ == "__main__":
         log(f"[*] Шлюз: {current_gateway}")
         set_system_dns(LISTEN_IP)
 
-    # Запуск всех фоновых процессов
     threading.Thread(target=gateway_watcher, daemon=True).start()
     threading.Thread(target=route_garbage_collector, daemon=True).start()
     threading.Thread(target=sleep_detector, daemon=True).start()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    
+
     try:
         sock.bind((LISTEN_IP, LISTEN_PORT))
         log(f"[*] Слушаю {LISTEN_IP}:{LISTEN_PORT}")
