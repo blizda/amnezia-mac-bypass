@@ -21,9 +21,11 @@
 
 ## 🚀 Установка (В одну строку)
 
-Откройте Терминал и выполните команду:
+Откройте Терминал и выполните команду
 
+```bash
 curl -sL https://raw.githubusercontent.com/blizda/amnezia-mac-bypass/main/install.sh | sudo bash
+```
 
 *Скрипт автоматически проверит зависимости, установит нужные Python-библиотеки, настроит безопасные права и запустит фоновую службу.*
 
@@ -31,24 +33,32 @@ curl -sL https://raw.githubusercontent.com/blizda/amnezia-mac-bypass/main/instal
 
 Если вы хотите добавить свои домены, которые должны идти в обход VPN, откройте основной скрипт после установки:
 
+```bash
 sudo nano /opt/bypass/bypass.py
+```
 
 Найдите переменную `DIRECT_DOMAINS` и добавьте нужные зоны (обязательно с точкой в конце для корневых зон!):
 
+```python
 DIRECT_DOMAINS = (
     ".ru.", ".vk.com.", ".vk.me.", "yandex.cloud.", ".my-custom-domain.com."
 )
+```
 
 После сохранения изменений перезапустите службу для их применения:
 
+```bash
 sudo launchctl unload -w /Library/LaunchDaemons/com.local.bypass.plist
 sudo launchctl load -w /Library/LaunchDaemons/com.local.bypass.plist
+```
 
 ## 📋 Логи и отладка
 
 Скрипт работает тихо и незаметно. Если вы хотите посмотреть, как он маршрутизирует трафик или реагирует на включение VPN в реальном времени, откройте логи:
 
+```bash
 tail -f /var/log/bypass.log
+```
 
 *(Для выхода из просмотра логов нажмите `Ctrl+C`).*
 
@@ -56,13 +66,17 @@ tail -f /var/log/bypass.log
 
 Чтобы полностью удалить инструмент из системы и вернуть настройки DNS по умолчанию, выполните команду:
 
+```bash
 curl -sL https://raw.githubusercontent.com/blizda/amnezia-mac-bypass/main/uninstall.sh | sudo bash
+```
 
 **Ручное удаление (на всякий случай):**
 
+```bash
 sudo launchctl unload -w /Library/LaunchDaemons/com.local.bypass.plist
 sudo rm -f /Library/LaunchDaemons/com.local.bypass.plist
 sudo rm -rf /opt/bypass
 sudo networksetup -setdnsservers Wi-Fi Empty
 sudo dscacheutil -flushcache
 sudo killall -HUP mDNSResponder
+```
