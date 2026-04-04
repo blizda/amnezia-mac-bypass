@@ -37,7 +37,7 @@ CMD_KILLALL = "/usr/bin/killall"
 CMD_ROUTE = "/sbin/route"
 
 DIRECT_DOMAINS = (
-    ".ru.", ".vk.com.", ".vk.me.", "yandex.cloud."
+    ".ru.", ".vk.com.", ".vk.me.", "yandex.cloud.", "boosty.to."
 )
 
 def log(msg):
