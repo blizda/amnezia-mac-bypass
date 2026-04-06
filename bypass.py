@@ -119,8 +119,8 @@ def get_vpn_route_state():
 
 def flush_dns_cache():
     try:
-        subprocess.run([CMD_DSCACHEUTIL, "-flushcache"], capture_output=True)
-        subprocess.run([CMD_KILLALL, "-HUP", "mDNSResponder"], capture_output=True)
+        subprocess.run([CMD_DSCACHEUTIL, "-flushcache"], capture_output=True, timeout=5)
+        subprocess.run([CMD_KILLALL, "-HUP", "mDNSResponder"], capture_output=True, timeout=5)
     except Exception:
         pass
 
@@ -158,9 +158,10 @@ def query_fastest_udp(data, ips, timeout=1.0):
         for ip in ips:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # ИСПРАВЛЕНИЕ: Сразу добавляем в список, чтобы finally гарантированно закрыл сокет
+                sockets.append(sock)
                 sock.setblocking(False)
                 sock.sendto(data, (ip, 53))
-                sockets.append(sock)
             except Exception:
                 pass
 
@@ -192,6 +193,7 @@ def query_fastest_udp(data, ips, timeout=1.0):
                     except Exception:
                         pass
     finally:
+        # Теперь все сокеты точно дойдут до этого блока очистки
         for sock in sockets:
             try:
                 sock.close()
@@ -368,29 +370,35 @@ def handle_request(data, addr, main_sock):
                             routed_ips[ip] = time.time()
 
                     if need_to_route:
-                        # СИНХРОННО: сначала удаляем старый, потом добавляем новый маршрут
-                        subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True)
-                        cmd = [CMD_ROUTE, "-q", "add", "-host", ip, local_gw, "-ifp", local_dev]
-                        res = subprocess.run(cmd, capture_output=True)
+                        # ИСПРАВЛЕНИЕ: Добавлены таймауты, чтобы защитить пул потоков от зависания
+                        try:
+                            subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
+                            cmd = [CMD_ROUTE, "-q", "add", "-host", ip, local_gw, "-ifp", local_dev]
+                            res = subprocess.run(cmd, capture_output=True, timeout=3)
 
-                        if res.returncode == 0:
-                            log(f"[+] Маршрут: {qname} -> {ip} via {local_gw} (dev {local_dev})")
-                        else:
-                            err = res.stderr.decode('utf-8', errors='ignore').strip()
-                            log(f"[-] Ошибка добавления {ip}: {err}", True)
+                            if res.returncode == 0:
+                                log(f"[+] Маршрут: {qname} -> {ip} via {local_gw} (dev {local_dev})")
+                            else:
+                                err = res.stderr.decode('utf-8', errors='ignore').strip()
+                                log(f"[-] Ошибка добавления {ip}: {err}", True)
+                        except subprocess.TimeoutExpired:
+                            log(f"[-] Ошибка: ОС слишком долго добавляла маршрут для {ip}", True)
+                        except Exception as e:
+                            log(f"[-] Ошибка вызова route для {ip}: {e}", True)
 
-        # Отдаем ответ ТОЛЬКО когда маршруты прописаны в ядре ОС
         main_sock.sendto(resp_data, addr)
 
     except Exception as e:
-        log(f"[-] Ошибка в обработчике запросов: {e}", True)
+        # Убрал вывод ошибки в консоль на каждый битый пакет (иначе спамит в лог),
+        # оставляем только для отладки, если нужно
+        pass
 
 # --- ТОЧКА ВХОДА ---
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, cleanup_and_exit)
     signal.signal(signal.SIGINT, cleanup_and_exit)
 
-    log("[*] Запуск DNS Route Injector Pro v3 (Sync Route + Interface Bind + Pool)")
+    log("[*] Запуск DNS Route Injector Pro v4 (Stable + Leak Free)")
 
     current_dev, current_service_name, current_gateway = get_physical_network_info()
     if not current_gateway:
@@ -420,5 +428,4 @@ if __name__ == "__main__":
                 data, addr = sock.recvfrom(4096)
                 executor.submit(handle_request, data, addr, sock)
             except Exception as e:
-                time.sleep(1)
-                
+                time.sleep(0.1)
