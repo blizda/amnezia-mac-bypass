@@ -22,7 +22,7 @@ PUBLIC_DNS_POOL = ["1.1.1.1", "9.9.9.9", "8.8.8.8"]
 ROUTE_TTL = 3600 * 12
 GW_CHECK_INTERVAL = 3
 GC_INTERVAL = 300
-MAX_ROUTES = 500
+MAX_ROUTES = 3000 # Лимит увеличен для современных реалий
 
 DIRECT_DOMAINS = (
     ".ru.", ".vk.com.", ".vk.me.", "yandex.cloud.", "boosty.to.", "reddit.com."
@@ -30,17 +30,22 @@ DIRECT_DOMAINS = (
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ И БЛОКИРОВКИ ---
 state_lock = threading.Lock()
+route_os_lock = threading.Lock() # Мьютекс для сериализации вызовов ОС (защита ядра от race conditions)
+
 routed_ips = {}
 current_gateway = None
 current_service_name = "Wi-Fi"
 current_dev = "en0"
 current_fallback_dns = ["8.8.8.8"]
 
+# Предохранитель (Circuit Breaker) для DoH
+doh_consecutive_fails = 0
+doh_disabled_until = 0
+
 doh_session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
 doh_session.mount("https://", adapter)
 
-# --- БЕЗОПАСНЫЙ ПОИСК СИСТЕМНЫХ УТИЛИТ ---
 def get_cmd(name, default_path):
     return shutil.which(name) or default_path
 
@@ -60,7 +65,6 @@ try:
 except Exception as e:
     log(f"[-] Ошибка установки лимитов FD: {e}", True)
 
-# --- СЕТЕВЫЕ ФУНКЦИИ ---
 def get_physical_network_info():
     for dev in ["en0", "en1", "en2", "en3", "en4", "en5"]:
         try:
@@ -133,11 +137,13 @@ def flush_os_routes():
         return
 
     log(f"[*] Очистка {len(ips_to_delete)} системных маршрутов...")
-    for ip in ips_to_delete:
-        try:
-            subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
-        except Exception:
-            pass
+
+    with route_os_lock:
+        for ip in ips_to_delete:
+            try:
+                subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
+            except Exception:
+                pass
 
 def set_system_dns(dns_server, service_name):
     try:
@@ -158,7 +164,6 @@ def query_fastest_udp(data, ips, timeout=1.0):
         for ip in ips:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # ИСПРАВЛЕНИЕ: Сразу добавляем в список, чтобы finally гарантированно закрыл сокет
                 sockets.append(sock)
                 sock.setblocking(False)
                 sock.sendto(data, (ip, 53))
@@ -168,9 +173,9 @@ def query_fastest_udp(data, ips, timeout=1.0):
         if not sockets:
             return None
 
-        start_time = time.time()
+        start_time = time.monotonic()
         while sockets:
-            remain = timeout - (time.time() - start_time)
+            remain = timeout - (time.monotonic() - start_time)
             if remain <= 0:
                 break
 
@@ -193,7 +198,6 @@ def query_fastest_udp(data, ips, timeout=1.0):
                     except Exception:
                         pass
     finally:
-        # Теперь все сокеты точно дойдут до этого блока очистки
         for sock in sockets:
             try:
                 sock.close()
@@ -269,8 +273,9 @@ def sleep_detector():
         mono_delta = now_mono - last_mono
 
         if (wall_delta - mono_delta) > 5.0:
-            log(f"[*] ДЕТЕКТОР СНА: Выход из спящего режима (спали ~{int(wall_delta)}с). Обновление маршрутов...")
-            flush_os_routes()
+            log(f"[*] ДЕТЕКТОР СНА: Выход из спящего режима (спали ~{int(wall_delta)}с). Сброс маршрутов и DNS...")
+            #flush_os_routes()
+            flush_dns_cache()
 
         last_wall = now_wall
         last_mono = now_mono
@@ -285,12 +290,13 @@ def route_garbage_collector():
             for ip in expired_ips:
                 del routed_ips[ip]
 
-        for ip in expired_ips:
-            try:
-                subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
-                log(f"[-] Маршрут удален по TTL: {ip}")
-            except Exception:
-                pass
+        with route_os_lock:
+            for ip in expired_ips:
+                try:
+                    subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
+                    log(f"[-] Маршрут удален по TTL: {ip}")
+                except Exception:
+                    pass
 
 def cleanup_and_exit(signum, frame):
     log("\n[*] Завершение работы. Очистка DNS и маршрутов...")
@@ -302,14 +308,18 @@ def cleanup_and_exit(signum, frame):
 
 # --- ОБРАБОТКА DNS ---
 def handle_request(data, addr, main_sock):
+    global doh_consecutive_fails, doh_disabled_until
+
     try:
         record = DNSRecord.parse(data)
         qname = str(record.q.qname).lower()
         qtype = record.q.qtype
         is_direct = qname.endswith(DIRECT_DOMAINS)
 
+        # Гасим IPv6 правильно: возвращаем NXDOMAIN
         if is_direct and qtype == 28:
             reply = record.reply()
+            reply.header.rcode = 3
             main_sock.sendto(reply.pack(), addr)
             return
 
@@ -317,6 +327,7 @@ def handle_request(data, addr, main_sock):
             local_gw = current_gateway
             local_dev = current_dev
             isp_dns = current_fallback_dns[0] if current_fallback_dns else None
+            do_doh = time.time() > doh_disabled_until
 
         resp_data = None
 
@@ -331,16 +342,24 @@ def handle_request(data, addr, main_sock):
             resp_data = query_fastest_udp(data, query_ips, timeout=1.5)
 
         else:
-            headers = {"Accept": "application/dns-message", "Content-Type": "application/dns-message"}
-            try:
-                with doh_session.post(DOH_URL, data=data, headers=headers, timeout=1.5, verify=True) as resp:
-                    if resp.status_code == 200:
-                        resp_data = resp.content
-            except Exception:
-                pass
+            if do_doh:
+                headers = {"Accept": "application/dns-message", "Content-Type": "application/dns-message"}
+                try:
+                    with doh_session.post(DOH_URL, data=data, headers=headers, timeout=1.0, verify=True) as resp:
+                        if resp.status_code == 200:
+                            resp_data = resp.content
+                            with state_lock:
+                                doh_consecutive_fails = 0
+                except Exception:
+                    with state_lock:
+                        doh_consecutive_fails += 1
+                        if doh_consecutive_fails >= 3:
+                            doh_disabled_until = time.time() + 60
+                            doh_consecutive_fails = 0
+                            log("[!] DoH сервер недоступен (таймауты). Переход на резервный UDP на 60 секунд!", True)
 
             if not resp_data:
-                resp_data = query_fastest_udp(data, PUBLIC_DNS_POOL, timeout=1.5)
+                resp_data = query_fastest_udp(data, PUBLIC_DNS_POOL, timeout=1.0)
 
         if not resp_data:
             return
@@ -358,9 +377,22 @@ def handle_request(data, addr, main_sock):
                         if len(routed_ips) >= MAX_ROUTES:
                             need_flush = True
 
+                    # Мягкая очистка старых маршрутов
                     if need_flush:
-                        log("[!] Превышен лимит маршрутов. Полный сброс.")
-                        flush_os_routes()
+                        log(f"[!] Превышен лимит маршрутов ({MAX_ROUTES}). Удаляем 50 самых старых.")
+                        ips_to_remove = []
+                        with state_lock:
+                            sorted_ips = sorted(routed_ips.items(), key=lambda item: item[1])
+                            ips_to_remove = [old_ip for old_ip, _ in sorted_ips[:50]]
+                            for old_ip in ips_to_remove:
+                                del routed_ips[old_ip]
+
+                        with route_os_lock:
+                            for old_ip in ips_to_remove:
+                                try:
+                                    subprocess.run([CMD_ROUTE, "-q", "delete", "-host", old_ip], capture_output=True, timeout=2)
+                                except Exception:
+                                    pass
 
                     with state_lock:
                         if ip not in routed_ips:
@@ -370,27 +402,26 @@ def handle_request(data, addr, main_sock):
                             routed_ips[ip] = time.time()
 
                     if need_to_route:
-                        # ИСПРАВЛЕНИЕ: Добавлены таймауты, чтобы защитить пул потоков от зависания
-                        try:
-                            subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
-                            cmd = [CMD_ROUTE, "-q", "add", "-host", ip, local_gw, "-ifp", local_dev]
-                            res = subprocess.run(cmd, capture_output=True, timeout=3)
+                        # Строгая сериализация системных вызовов
+                        with route_os_lock:
+                            try:
+                                subprocess.run([CMD_ROUTE, "-q", "delete", "-host", ip], capture_output=True, timeout=2)
+                                cmd = [CMD_ROUTE, "-q", "add", "-host", ip, local_gw, "-ifp", local_dev]
+                                res = subprocess.run(cmd, capture_output=True, timeout=3)
 
-                            if res.returncode == 0:
-                                log(f"[+] Маршрут: {qname} -> {ip} via {local_gw} (dev {local_dev})")
-                            else:
-                                err = res.stderr.decode('utf-8', errors='ignore').strip()
-                                log(f"[-] Ошибка добавления {ip}: {err}", True)
-                        except subprocess.TimeoutExpired:
-                            log(f"[-] Ошибка: ОС слишком долго добавляла маршрут для {ip}", True)
-                        except Exception as e:
-                            log(f"[-] Ошибка вызова route для {ip}: {e}", True)
+                                if res.returncode == 0:
+                                    log(f"[+] Маршрут: {qname} -> {ip} via {local_gw} (dev {local_dev})")
+                                else:
+                                    err = res.stderr.decode('utf-8', errors='ignore').strip()
+                                    log(f"[-] Ошибка добавления {ip}: {err}", True)
+                            except subprocess.TimeoutExpired:
+                                log(f"[-] Ошибка: ОС слишком долго добавляла маршрут для {ip}", True)
+                            except Exception as e:
+                                log(f"[-] Ошибка вызова route для {ip}: {e}", True)
 
         main_sock.sendto(resp_data, addr)
 
-    except Exception as e:
-        # Убрал вывод ошибки в консоль на каждый битый пакет (иначе спамит в лог),
-        # оставляем только для отладки, если нужно
+    except Exception:
         pass
 
 # --- ТОЧКА ВХОДА ---
@@ -398,7 +429,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, cleanup_and_exit)
     signal.signal(signal.SIGINT, cleanup_and_exit)
 
-    log("[*] Запуск DNS Route Injector Pro v4 (Stable + Leak Free)")
+    log(f"[*] Запуск DNS Route Injector Pro v6 (Anti-Hang, OS-Lock & Watchdog) - Limit: {MAX_ROUTES}")
 
     current_dev, current_service_name, current_gateway = get_physical_network_info()
     if not current_gateway:
@@ -414,6 +445,8 @@ if __name__ == "__main__":
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Расширяем буфер приема UDP для гашения всплесков пакетов
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
 
     try:
         sock.bind((LISTEN_IP, LISTEN_PORT))
@@ -426,6 +459,14 @@ if __name__ == "__main__":
         while True:
             try:
                 data, addr = sock.recvfrom(4096)
+
+                if executor._work_queue.qsize() > 40:
+                    log("[!] ВНИМАНИЕ: Очередь пула потоков перегружена! Возможны задержки DNS.", True)
+
                 executor.submit(handle_request, data, addr, sock)
-            except Exception as e:
+            except OSError as e:
+                log(f"[-] Системная ошибка сокета: {e}", True)
                 time.sleep(0.1)
+            except Exception as e:
+                log(f"[-] Критическая ошибка в главном цикле: {e}", True)
+                time.sleep(1)
